@@ -31,13 +31,22 @@ _worker_lock = threading.Lock()
 
 # ---------------------------------------------------------------- 引导
 def bootstrap(conn) -> None:
-    """幂等创建长表/状态表/双写触发器（单事务）。"""
+    """幂等创建长表/状态表/双写触发器/校正台账（单事务）。"""
     exists = conn.execute(
         "SELECT 1 FROM information_schema.tables WHERE table_name = 'measurements'"
     ).fetchone()
     if exists is not None:
+        # 02 已执行过；04 是后加的校正台账，按表名独立判存，老库重启时自动补齐
+        cal_exists = conn.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_name = 'calibration_orders'"
+        ).fetchone()
+        if cal_exists is None:
+            conn.execute((SQL_DIR / "04_calibration.sql").read_text(encoding="utf-8"))
+            conn.commit()
         return
     conn.execute((SQL_DIR / "02_expand.sql").read_text(encoding="utf-8"))
+    conn.execute((SQL_DIR / "04_calibration.sql").read_text(encoding="utf-8"))
     conn.commit()
 
 

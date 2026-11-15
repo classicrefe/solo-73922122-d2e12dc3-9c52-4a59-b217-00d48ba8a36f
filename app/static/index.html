@@ -60,6 +60,30 @@
        模拟进程崩溃，刷新后可看到阶段自动回到 ready，旧接口不受影响。</p>
   </section>
 
+  <section class="card full">
+    <h2>温度探头两点校正（仅在回填完成 ready、最终切换前可操作）</h2>
+    <form onsubmit="return submitCalibration(event)" style="line-height:2.2">
+      <label>校正单号
+        <input name="order_no" placeholder="如 CAL-2026-001" required
+               style="width:180px"></label><br>
+      标定点1：原始温度 <input name="raw1" placeholder="raw1" required>
+             标准温度 <input name="std1" placeholder="std1" required><br>
+      标定点2：原始温度 <input name="raw2" placeholder="raw2" required>
+             标准温度 <input name="std2" placeholder="std2" required><br>
+      <label>样本编号（逗号/空格分隔，至多 20 个）
+        <input name="sample_ids" placeholder="如 1, 2, 3" required
+               style="width:360px"></label><br>
+      <button class="primary" type="submit">提交校正单</button>
+      <span class="muted">修正温度 = round(a·当前温度+b, 2)，两点确定 a/b；
+        pH 保持不变；任一编号缺失、两点相同或修正值超 temp 列范围则整单失败、原值保留。</span>
+    </form>
+    <div id="cal-result"></div>
+    <h2 style="margin-top:14px">已成功校正单</h2>
+    <table><thead><tr><th>校正单号</th><th>原始点1→标准1</th><th>原始点2→标准2</th>
+      <th>样本数</th><th>提交时间</th></tr></thead>
+      <tbody id="cal-orders"></tbody></table>
+  </section>
+
   <section class="card">
     <h2>旧入口 /samples（宽表语义，切换后为同名视图）</h2>
     <form onsubmit="return postSample(event)">
@@ -130,6 +154,59 @@ async function delSample(id) {
 function esc(s){return String(s).replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
+async function submitCalibration(ev) {
+  ev.preventDefault();
+  const f = ev.target;
+  const ids = f.sample_ids.value.split(/[\s,，]+/).filter(Boolean).map(Number);
+  const payload = {
+    order_no: f.order_no.value.trim(),
+    raw1: +f.raw1.value, std1: +f.std1.value,
+    raw2: +f.raw2.value, std2: +f.std2.value,
+    sample_ids: ids
+  };
+  try {
+    const r = await api('calibrations', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    log(`校正单 ${r.order.order_no} ${r.replayed ? '重试回放' : '提交成功'}，` +
+        `共 ${r.samples.length} 个样本（a=${r.order.slope}, b=${r.order.intercept}）`);
+    renderCalibration(r);
+    f.reset();
+  } catch (e) {
+    log('校正失败（整单回滚，原值保留）: ' + e.message);
+    document.getElementById('cal-result').innerHTML =
+      `<p style="color:#b91c1c">✗ ${esc(e.message)}</p>`;
+  }
+  refresh();
+  return false;
+}
+
+function renderCalibration(r) {
+  const o = r.order;
+  const rows = r.samples.map(s =>
+    `<tr><td>${s.sample_id}</td>
+      <td>${s.temp_before}</td><td><b>${s.temp_after}</b></td>
+      <td>${s.ph_before}</td><td>${s.ph_after}</td></tr>`).join('');
+  document.getElementById('cal-result').innerHTML =
+    `<p style="color:#166534">✔ 校正单 <b>${esc(o.order_no)}</b>
+       ${r.replayed ? '（同号同内容重试，回放首次结果）' : ''}：
+       a=${o.slope}，b=${o.intercept}，
+       修正温度=round(a·原始温度+b, 2)，pH 不变</p>
+     <table><thead><tr><th>样本编号</th><th>修正前 temp</th><th>修正后 temp</th>
+       <th>修正前 ph</th><th>修正后 ph</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function refreshCalibrations() {
+  try {
+    const orders = await api('calibrations');
+    document.getElementById('cal-orders').innerHTML = orders.map(o =>
+      `<tr><td><a href="/calibrations/${encodeURIComponent(o.order_no)}"
+         target="_blank">${esc(o.order_no)}</a></td>
+       <td>${o.raw1} → ${o.std1}</td><td>${o.raw2} → ${o.std2}</td>
+       <td>${o.sample_count}</td><td>${esc(o.created_at)}</td></tr>`).join('')
+      || '<tr><td colspan="5" class="muted">尚无校正单</td></tr>';
+  } catch (e) { /* 控制台主刷新仍继续 */ }
+}
+
 async function refresh() {
   try {
     const p = await api('migration/progress');
@@ -155,6 +232,8 @@ async function refresh() {
     document.getElementById('measurements').innerHTML = meas.map(m =>
       `<tr><td>${m.sample_id}</td><td>${esc(m.metric)}</td><td>${m.value}</td></tr>`
     ).join('') || '<tr><td colspan="3" class="muted">无数据</td></tr>';
+
+    await refreshCalibrations();
   } catch (e) { log('刷新失败: ' + e.message); }
 }
 refresh();

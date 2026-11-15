@@ -24,6 +24,14 @@
 | 切换后旧名称/列仍支持 SELECT 与增改删 | `samples` 变为同名视图（列仍为 `id,temp,ph`）+ `INSTEAD OF` 触发器把写下沉到长表 |
 | 新旧入口读写同一份数据 | 切换前：表+触发器；切换后：视图+触发器。两个 HTTP 入口都经 `samples` 这一个写入面 |
 | 可启动迁移、查进度的网页 | 内置控制台 `/`，含阶段徽章、水位、一致性校验、增改删与崩溃演示按钮 |
+| 温度两点校正只在回填后切换前开放 | 校正接口校验 `migration_state.state='ready'`，其余阶段一律 409 拒绝 |
+| 校正单：单号 + 两对原始/标准温度 + 至多 20 个编号 | `POST /calibrations` 与控制台表单；Pydantic 限 1~20 个编号，请求内自动去重 |
+| 两点线性换算、两位小数、pH 不变 | `a=(std2-std1)/(raw2-raw1)`、`b=std1-a·raw1`，`round_half_up(a·当前温度+b, 2)`；只更新 temp，ph 原样写回 |
+| 编号缺失/两点相同/修正值超 temp 范围整单失败 | 全部校验在单事务内完成，失败整体回滚，失败单不留台账、任何原值保留 |
+| 与旧程序直接 SQL 交错时用实际当前值 | 事务内先 `SELECT ... FOR UPDATE` 锁全部目标行，并发 UPDATE/DELETE 排队，换算基于锁保护下的当前值 |
+| 两项指标一起提交 | 校正经 `samples` 单一写入面 UPDATE，表时代双写触发器/视图时代 INSTEAD OF 触发器在同一事务维护 temp、ph 两行 |
+| 同号同内容重试回放首次结果、异内容报冲突 | `calibration_orders.order_no` 唯一；命中已存在单号时比对四点内容，相同则回放、不同则 409 |
+| 编号校正一次后复用也不能再校正 | `calibration_order_samples.sample_id` 全局唯一，删除并复用同一 id 仍被拒绝 |
 | Docker Compose 可实际启动 | `docker compose up` 一键拉起 Postgres 16 + API，自带 12 行虚构数据 |
 
 ---
@@ -62,13 +70,15 @@ Contract（最终切换，全程唯一写阻塞窗口，单事务）
 │   ├── init/01_baseline.sql    # 旧世界：samples 表 + 12 行虚构数据（容器首次启动自动执行）
 │   └── migrations/
 │       ├── 02_expand.sql       # 长表、状态表、双写触发器（应用引导时执行）
-│       └── 03_contract.sql     # 同名视图 + INSTEAD OF 触发器（切换时执行）
+│       ├── 03_contract.sql     # 同名视图 + INSTEAD OF 触发器（切换时执行）
+│       └── 04_calibration.sql  # 校正单台账 + 编号一生一次唯一登记（应用引导时幂等执行）
 ├── app/
-│   ├── main.py                 # FastAPI 路由（迁移控制 + 新旧两套入口 + 网页）
+│   ├── main.py                 # FastAPI 路由（迁移控制 + 校正 + 新旧两套入口 + 网页）
 │   ├── migration.py            # 回填引擎、状态机、一致性校验、原子切换
+│   ├── calibration.py          # 温度两点校正（阶段闸门、行锁、线性换算、单号幂等）
 │   ├── crud.py                 # 新旧入口的数据访问（全部事务化、整组写）
 │   ├── db.py / config.py / schemas.py
-│   └── static/index.html       # 迁移控制台（原生 JS，无构建步骤）
+│   └── static/index.html       # 迁移 + 校正控制台（原生 JS，无构建步骤）
 ├── demo/run_demo.sh            # 端到端演示脚本
 └── tests/                      # pytest 全生命周期测试
 ```
@@ -113,6 +123,32 @@ curl -s localhost:8000/migration/progress
 `GET /measurements`、`GET/DELETE /measurements/{sample_id}`、
 `POST /measurements`、`PUT /measurements/{sample_id}`（整组替换两项）
 
+### 温度两点校正（仅回填完成 `ready`、最终切换前）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/calibrations` | 提交校正单（整单事务，失败原值保留），返回每个编号修正前后的 temp/ph |
+| GET  | `/calibrations` | 已成功校正单列表（含两点参数、换算系数、样本数） |
+| GET  | `/calibrations/{order_no}` | 单据详情：首次结果回放、修正前后留痕 |
+
+请求体：
+
+```json
+{
+  "order_no": "CAL-2026-001",
+  "raw1": 20.0, "std1": 21.0,
+  "raw2": 30.0, "std2": 32.0,
+  "sample_ids": [1, 2, 3]
+}
+```
+
+换算规则：`a=(std2-std1)/(raw2-raw1)`、`b=std1-a·raw1`，
+修正温度 `= round_half_up(a·当前温度 + b, 2)`，pH 保持不变。
+整单失败（HTTP 409）的条件：阶段不是 `ready`、两个原始点相同、
+任一编号缺失、编号已成功校正过（含删除后复用同一编号）、
+修正值超出 `temp NUMERIC(8,2)` 范围 `[-999999.99, 999999.99]`。
+单号幂等：同号同内容的成功重试返回首次结果（`replayed=true`），同号异内容报冲突。
+
 ### 崩溃演示
 
 `POST /debug/crash`（仅 `ALLOW_CRASH_DEMO=1` 开启）：进程硬退出，
@@ -139,6 +175,8 @@ docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build
 - D 两项修改的原子性（NOT NULL 失败整体回滚）
 - E 切换中退出：NOWAIT 探针证明排他锁存在 → 回滚 409 → 旧表完好可写
 - E2 进程硬退出后重启，从已提交水位自动续办
+- E3 温度两点校正：线性换算/两位小数/pH 不变、三类整单失败原值保留、
+  同号回放与冲突、编号复用不可再校正、修正前后留痕
 - F 最终切换：`samples` 变视图，旧名旧列仍支持 SELECT/增改删
 - F1 视图显式 id 写入后序列水位自动抬升
 - F2 新旧 HTTP 入口读写同一份数据
@@ -178,6 +216,23 @@ bash demo/run_demo.sh
 原 identity 序列随表删除，切换事务重建 `samples_id_seq` 并对齐到最大 id；
 视图 INSERT 触发器在 `NEW.id IS NULL` 时取序列，显式 id 写入时抬升序列水位。
 
+**校正为什么能与旧程序直接 SQL 的改/删交错而不串值？**
+校正事务第一步对全部目标编号执行 `SELECT ... FOR UPDATE`：旧程序并发的
+UPDATE/DELETE 会在元组锁上排队，直到校正事务提交/回滚，因此换算读取的
+`temp/ph` 就是锁保护下实际参与计算的当前值。校正本身只经 `samples` 这一个
+写入面 UPDATE，表时代的双写触发器或视图时代的 INSTEAD OF 触发器在同一事务
+内整组维护 temp、ph 两行，两项必然一起生效、一起回滚。
+
+**为什么复用编号也不能再次校正？**
+`calibration_order_samples.sample_id` 有全局唯一约束，登记的是“编号被成功
+校正过”这一事实而非当前行。旧程序删除该编号并以同一 id 插入新行后，新单
+在校验阶段即命中唯一登记，整单 409 回滚，新行原值保留。
+
+**失败的校正单会不会留下半成品？**
+不会。阶段闸门、两点非重合、编号存在性与唯一性、修正值范围全部在同一事务内
+先校验后写入；任一条不满足即抛错回滚，台账不插入、`samples` 不更新，
+接口返回 409 且明细说明失败原因。
+
 ---
 
 ## 8. 无 Docker 的本机运行（可选）
@@ -207,6 +262,8 @@ ADMIN_DATABASE_URL="postgresql:///postgres?host=%2Fvar%2Frun%2Fpostgresql&user=p
 pytest tests/ -v
 ```
 
-7 个用例覆盖：初始进度、回填完成且每组两项、暂停续办、
+20 个用例覆盖：初始进度、回填完成且每组两项、暂停续办、
 直接 SQL 改/删/复用 ID 的存活、两项原子更新、失败切换回滚保旧接口、
-成功切换后视图与双入口同数据。
+成功切换后视图与双入口同数据，以及温度两点校正的阶段闸门、线性换算与
+四舍五入、三类整单失败、编号一生一次（含复用）、单号幂等/冲突、
+与直接 SQL 交错时按实际当前值换算、两项一起提交。

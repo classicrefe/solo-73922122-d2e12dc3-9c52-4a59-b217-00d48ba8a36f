@@ -144,6 +144,58 @@ for i in $(seq 1 20); do curl -sf "$BASE_URL/health" >/dev/null 2>&1 && break; s
 wait_phase ready 30
 ok "重启后自动续办至 ready（水位从断点继续，无重扫/丢失）"
 
+step "E3. 温度探头两点校正（仅 ready 且切换前；整单事务，失败原值保留）"
+# 当前处于 ready：校正网页 / 或 POST /calibrations 提交
+#   校正单号 + 两对（原始温度,标准温度）+ 至多 20 个样本编号
+# a=(32-21)/(30-20)=1.1, b=21-1.1*20=-1 => 修正温度=round(1.1*当前温度-1, 2)
+$PSQL -c "SELECT '校正前 id1: '||temp||'/'||ph FROM samples WHERE id=1;"
+CAL=$(curl -s -X POST "$BASE_URL/calibrations" -H 'Content-Type: application/json' \
+  -d '{"order_no":"CAL-DEMO-1","raw1":20,"std1":21,"raw2":30,"std2":32,"sample_ids":[1,2]}')
+echo "$CAL" | python3 -m json.tool
+[ "$(echo "$CAL" | jget "d['replayed']")" = "False" ] && ok "校正单首次提交成功"
+$PSQL -c "SELECT '校正后 id1（pH 不变）: '||temp||'/'||ph FROM samples WHERE id=1;"
+V=$($PSQL -c "SELECT ph FROM samples WHERE id=1;")
+[ "$V" = "7.10" ] && ok "pH 保持不变，仅温度按两点线性关系换算并四舍五入两位小数"
+# 分析员沿原接口即可取得校正值（长表由触发器在同一事务同步）
+curl -s "$BASE_URL/measurements/1" | python3 -m json.tool
+
+# 同号同内容重试 => 回放首次结果；同号异内容 => 409 冲突
+R=$(curl -s -X POST "$BASE_URL/calibrations" -H 'Content-Type: application/json' \
+  -d '{"order_no":"CAL-DEMO-1","raw1":20,"std1":21,"raw2":30,"std2":32,"sample_ids":[1,2]}')
+[ "$(echo "$R" | jget "d['replayed']")" = "True" ] && ok "同号同内容重试回放首次结果"
+curl -s -o /tmp/cal_conf.json -w '冲突单 HTTP %{http_code}\n' \
+  -X POST "$BASE_URL/calibrations" -H 'Content-Type: application/json' \
+  -d '{"order_no":"CAL-DEMO-1","raw1":20,"std1":21,"raw2":30,"std2":33,"sample_ids":[1]}'
+grep -q 冲突 /tmp/cal_conf.json && ok "同号不同内容报冲突，数据维持首次校正结果"
+
+# 整单失败：编号缺失 / 两点相同 / 修正值超 temp 范围 —— 原值一律保留
+curl -s -o /tmp/c1.json -w '缺失编号 HTTP %{http_code}\n' -X POST "$BASE_URL/calibrations" \
+  -H 'Content-Type: application/json' \
+  -d '{"order_no":"CAL-BAD-1","raw1":20,"std1":21,"raw2":30,"std2":32,"sample_ids":[2,99999]}'
+curl -s -o /tmp/c2.json -w '两点相同 HTTP %{http_code}\n' -X POST "$BASE_URL/calibrations" \
+  -H 'Content-Type: application/json' \
+  -d '{"order_no":"CAL-BAD-2","raw1":25,"std1":26,"raw2":25,"std2":27,"sample_ids":[2]}'
+curl -s -o /tmp/c3.json -w '超范围   HTTP %{http_code}\n' -X POST "$BASE_URL/calibrations" \
+  -H 'Content-Type: application/json' \
+  -d '{"order_no":"CAL-BAD-3","raw1":0,"std1":0,"raw2":1,"std2":1000000,"sample_ids":[2]}'
+grep -q 缺失 /tmp/c1.json && grep -q 相同 /tmp/c2.json && grep -q 'temp 列范围' /tmp/c3.json \
+  && ok "三类非法单全部 409 整单失败"
+$PSQL -c "SELECT count(*) AS 失败单不留痕 FROM calibration_orders WHERE order_no LIKE 'CAL-BAD-%';" \
+  | grep -q '^0$' && ok "失败单不留任何台账，样本原值保留"
+
+# 编号一生一次：删除后复用同一 id 也不能再次校正
+curl -s -X POST "$BASE_URL/calibrations" -H 'Content-Type: application/json' \
+  -d '{"order_no":"CAL-DEMO-2","raw1":20,"std1":21,"raw2":30,"std2":32,"sample_ids":[6]}' >/dev/null
+$PSQL -c "DELETE FROM samples WHERE id=6;"
+$PSQL -c "INSERT INTO samples (id, temp, ph) OVERRIDING SYSTEM VALUE VALUES (6, 12.34, 6.50);"
+curl -s -o /tmp/c4.json -w '复用编号 HTTP %{http_code}\n' -X POST "$BASE_URL/calibrations" \
+  -H 'Content-Type: application/json' \
+  -d '{"order_no":"CAL-DEMO-3","raw1":20,"std1":21,"raw2":30,"std2":32,"sample_ids":[6,7]}'
+grep -q '不能再次校正' /tmp/c4.json && ok "编号删除后复用也不能再次校正"
+[ "$($PSQL -c 'SELECT temp FROM samples WHERE id=6;')" = "12.34" ] \
+  && ok "复用行原值保留，同单其他编号（7）也未被改动"
+curl -s "$BASE_URL/calibrations" | python3 -m json.tool
+
 step "F. 最终切换（唯一一次允许的短暂写阻塞）"
 curl -s -X POST "$BASE_URL/migration/switch" | jget "d['detail']"
 [ "$(phase)" = "switched" ] && ok "阶段=switched"

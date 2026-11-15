@@ -1,13 +1,16 @@
 from pathlib import Path
 
+from decimal import Decimal
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from psycopg.errors import CheckViolation, UniqueViolation
 from psycopg.rows import dict_row
 
-from . import crud, db, migration
+from . import calibration, crud, db, migration
+from .calibration import CalibrationError
 from .db import lifespan
-from .schemas import SampleIn
+from .schemas import CalibrationIn, SampleIn
 
 app = FastAPI(
     title="宽表 -> 指标长表在线迁移控制台",
@@ -55,6 +58,46 @@ def migration_switch(hold_seconds: float | None = None):
     result = migration.perform_switch(hold_seconds=hold_seconds)
     if not result["ok"]:
         raise HTTPException(status_code=409, detail=result["detail"])
+    return result
+
+
+# ------------------------------------------------ 温度两点校正
+@app.post("/calibrations")
+def calibration_submit(body: CalibrationIn):
+    """提交一张温度两点校正单（整单事务，失败原值保留）。"""
+    with db.pool.connection() as conn:
+        try:
+            return calibration.submit_calibration(
+                conn,
+                order_no=body.order_no,
+                raw1=Decimal(str(body.raw1)),
+                std1=Decimal(str(body.std1)),
+                raw2=Decimal(str(body.raw2)),
+                std2=Decimal(str(body.std2)),
+                sample_ids=body.sample_ids,
+            )
+        except CalibrationError as exc:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
+        except UniqueViolation as exc:
+            # 并发下唯一约束兜底（单号/编号竞争）：整单回滚，按冲突报告
+            conn.rollback()
+            raise HTTPException(status_code=409, detail=f"校正冲突：{exc}") from exc
+
+
+@app.get("/calibrations")
+def calibration_list():
+    """已成功校正单列表（编号留痕、可回放复核）。"""
+    with db.pool.connection() as conn:
+        return calibration.list_orders(conn)
+
+
+@app.get("/calibrations/{order_no}")
+def calibration_get(order_no: str):
+    with db.pool.connection() as conn:
+        result = calibration.get_order(conn, order_no)
+    if result is None:
+        raise HTTPException(404, "calibration order not found")
     return result
 
 
